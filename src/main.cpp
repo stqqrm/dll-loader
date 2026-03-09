@@ -109,17 +109,17 @@ struct Surface {
     }
 
     void rect(int x, int y, int rw, int rh, WORD attr) {
-        put(x, y, L'\x250C', attr);
-        put(x + rw - 1, y, L'\x2510', attr);
-        put(x, y + rh - 1, L'\x2514', attr);
-        put(x + rw - 1, y + rh - 1, L'\x2518', attr);
+        put(x, y, L'+', attr);
+        put(x + rw - 1, y, L'+', attr);
+        put(x, y + rh - 1, L'+', attr);
+        put(x + rw - 1, y + rh - 1, L'+', attr);
         for (int i = 1; i < rw - 1; ++i) {
-            put(x + i, y, L'\x2500', attr);
-            put(x + i, y + rh - 1, L'\x2500', attr);
+            put(x + i, y, L'-', attr);
+            put(x + i, y + rh - 1, L'-', attr);
         }
         for (int i = 1; i < rh - 1; ++i) {
-            put(x, y + i, L'\x2502', attr);
-            put(x + rw - 1, y + i, L'\x2502', attr);
+            put(x, y + i, L'|', attr);
+            put(x + rw - 1, y + i, L'|', attr);
         }
     }
 
@@ -275,10 +275,30 @@ fs::path SelectFile(
 #define C_MARK_BOX (FOREGROUND_RED   | FOREGROUND_GREEN | FOREGROUND_INTENSITY)
 #define C_WARN     (FOREGROUND_RED   | FOREGROUND_GREEN | FOREGROUND_INTENSITY | \
                     BACKGROUND_RED)
+#define C_SEARCH   (FOREGROUND_RED   | FOREGROUND_GREEN | FOREGROUND_BLUE | \
+                    BACKGROUND_GREEN | BACKGROUND_INTENSITY)
+#define C_SEARCH_K (FOREGROUND_GREEN | FOREGROUND_INTENSITY)
+
+static std::wstring to_lower(const std::wstring& s) {
+    std::wstring r = s;
+    std::transform(r.begin(), r.end(), r.begin(), ::towlower);
+    return r;
+}
+
+static bool proc_matches(const ProcEntry& p, const std::wstring& needle_lc) {
+    if (needle_lc.empty()) return true;
+    if (to_lower(p.name).find(needle_lc) != std::wstring::npos) return true;
+    if (p.hasWindow && to_lower(p.window).find(needle_lc) != std::wstring::npos) return true;
+
+    if (to_lower(std::to_wstring(p.pid)).find(needle_lc) != std::wstring::npos) return true;
+
+    return false;
+}
 
 struct App {
     Surface                surf;
     std::vector<ProcEntry> procs;
+    std::vector<int>       view;
     int                    cursor = 0;
     int                    scroll = 0;
     int                    marked = -1;
@@ -287,30 +307,96 @@ struct App {
     WORD                   statusColor = C_NORMAL;
     bool                   isAdmin = false;
 
+    bool         searching = false;
+    std::wstring searchBuf;
+
     void set_status(const std::wstring& s, WORD col = C_NORMAL) {
         status = s;
         statusColor = col;
     }
 
+    void rebuild_view() {
+        std::wstring needle = to_lower(searchBuf);
+        DWORD old_pid = view_cursor_pid();
+
+        view.clear();
+        for (int i = 0; i < (int)procs.size(); ++i)
+            if (proc_matches(procs[i], needle))
+                view.push_back(i);
+
+        cursor = 0;
+        if (old_pid) {
+            for (int i = 0; i < (int)view.size(); ++i) {
+                if (procs[view[i]].pid == old_pid) { cursor = i; break; }
+            }
+        }
+        int lh = list_height();
+        if (scroll > cursor) scroll = cursor;
+        if (scroll < cursor - lh + 1) scroll = cursor - lh + 1;
+        if (scroll < 0) scroll = 0;
+    }
+
+    DWORD view_cursor_pid() const {
+        if (cursor >= 0 && cursor < (int)view.size())
+            return procs[view[cursor]].pid;
+        return 0;
+    }
+
     void refresh_procs() {
-        DWORD cursorPid = (cursor >= 0 && cursor < (int)procs.size())
-            ? procs[cursor].pid : 0;
+        DWORD cursorPid = view_cursor_pid();
         DWORD markedPid = (marked >= 0 && marked < (int)procs.size())
             ? procs[marked].pid : 0;
 
         procs = enumerate_processes();
 
-        cursor = 0;
         marked = -1;
+        for (int i = 0; i < (int)procs.size(); ++i)
+            if (procs[i].pid == markedPid) { marked = i; break; }
 
-        for (int i = 0; i < (int)procs.size(); ++i) {
-            if (cursorPid != 0 && procs[i].pid == cursorPid) cursor = i;
-            if (markedPid != 0 && procs[i].pid == markedPid) marked = i;
+        rebuild_view();
+
+        if (cursorPid) {
+            for (int i = 0; i < (int)view.size(); ++i) {
+                if (procs[view[i]].pid == cursorPid) { cursor = i; break; }
+            }
         }
     }
 
-    int list_top()    const { return 3; }
-    int list_bottom() const { return surf.h - 4; }
+    int list_top() const { return 3; }
+
+    int hint_rows(int W) const {
+        struct Token { const wchar_t* key; const wchar_t* val; };
+        Token tokens[] = {
+            {L"[Up/Dn]",   L"move"},
+            {L"[PgUp/Dn]", L"page"},
+            {L"[Rt]",      L"mark"},
+            {L"[Lt]",      L"unmark"},
+            {L"[I]",       L"inject"},
+            {L"[E]",       L"eject"},
+            {L"[D]",       L"set dll"},
+            {L"[/]",       L"search"},
+            {L"[Q]",       L"quit"},
+            {L"[R]",       L"Run as Admin"},
+        };
+        int usable = W - 3;
+        int rows = 1, x = 2;
+        int count = isAdmin ? 9 : 10;
+        for (int i = 0; i < count; ++i) {
+            int w = (int)(wcslen(tokens[i].key) + wcslen(tokens[i].val)) + 1;
+            if (x + w > usable && x > 2) { ++rows; x = 2; }
+            x += w;
+        }
+        return rows;
+    }
+
+    int status_rows(int W) const {
+        if (status.empty()) return 0;
+        int usable = W - 4;
+        if (usable <= 0) return 1;
+        return ((int)status.size() + usable - 1) / usable;
+    }
+
+    int list_bottom() const { return surf.h - 1 - status_rows(surf.w) - hint_rows(surf.w) - 1; }
     int list_height() const { return list_bottom() - list_top(); }
 
     void clamp_scroll() {
@@ -328,7 +414,6 @@ struct App {
 
         surf.rect(0, 0, W, H, C_BORDER);
 
-        // title + optional admin warning in header
         if (!isAdmin) {
             const wchar_t* warn = L" ! NOT ADMINISTRATOR ! ";
             int wx = (W - (int)wcslen(warn)) / 2;
@@ -339,37 +424,69 @@ struct App {
             surf.text((W - (int)wcslen(title)) / 2, 0, title, C_HEADER);
         }
 
-        surf.hline(1, 2, W - 2, L'\x2500', C_BORDER);
-        surf.put(0, 2, L'\x251C', C_BORDER);
-        surf.put(W - 1, 2, L'\x2524', C_BORDER);
+        surf.hline(1, 2, W - 2, L'-', C_BORDER);
+        surf.put(0, 2, L'+', C_BORDER);
+        surf.put(W - 1, 2, L'+', C_BORDER);
+
+        if (searching) {
+            const wchar_t* prompt = L" Search: ";
+            surf.text(1, 1, prompt, C_SEARCH_K);
+            int px = 1 + (int)wcslen(prompt);
+
+            std::wstring display = searchBuf + L'_';
+            int avail = W - px - 2;
+            if ((int)display.size() > avail) display = display.substr(display.size() - avail);
+            surf.text(px, 1, display.c_str(), C_SEARCH);
+
+            wchar_t cnt[64];
+            swprintf(cnt, 64, L" [%d/%d] ESC=clear  ", (int)view.size(), (int)procs.size());
+            int cx = W - (int)wcslen(cnt) - 1;
+            if (cx > px + (int)display.size() + 1)
+                surf.text(cx, 1, cnt, C_DIM);
+        }
+        else {
+            const int colMark = 2;
+            const int colPid = 6;
+            const int colName = 14;
+            const int colWin = 40;
+            surf.text(colMark, 1, L"SEL", C_HEADER);
+            surf.text(colPid, 1, L"PID", C_HEADER);
+            surf.text(colName, 1, L"MODULE", C_HEADER);
+            surf.text(colWin, 1, L"WINDOW", C_HEADER);
+
+            if (!searchBuf.empty()) {
+                std::wstring hint = L"  filter: \"" + searchBuf + L"\"  [/] to edit  [ESC] to clear";
+                int hx = 2;
+                int avail = W - hx - 2;
+                if ((int)hint.size() > avail) hint = hint.substr(0, avail);
+                surf.text(hx, 1, hint.c_str(), C_SEARCH_K);
+            }
+        }
+
+        int sep = list_bottom();
+        surf.hline(1, sep, W - 2, L'-', C_BORDER);
+        surf.put(0, sep, L'+', C_BORDER);
+        surf.put(W - 1, sep, L'+', C_BORDER);
 
         const int colMark = 2;
         const int colPid = 6;
         const int colName = 14;
         const int colWin = 40;
 
-        surf.text(colMark, 1, L"SEL", C_HEADER);
-        surf.text(colPid, 1, L"PID", C_HEADER);
-        surf.text(colName, 1, L"MODULE", C_HEADER);
-        surf.text(colWin, 1, L"WINDOW", C_HEADER);
-
-        int sep = H - 3;
-        surf.hline(1, sep, W - 2, L'\x2500', C_BORDER);
-        surf.put(0, sep, L'\x251C', C_BORDER);
-        surf.put(W - 1, sep, L'\x2524', C_BORDER);
-
         int lh = list_height();
-        int rows = (int)procs.size();
+        int rows = (int)view.size();
         clamp_scroll();
 
         for (int i = 0; i < lh; ++i) {
-            int idx = scroll + i;
+            int vi = scroll + i;
             int row = list_top() + i;
-            if (idx >= rows) break;
+            if (vi >= rows) break;
 
+            int idx = view[vi];
             const auto& p = procs[idx];
-            bool        isCur = (idx == cursor);
-            bool        isMark = (idx == marked);
+
+            bool isCur = (vi == cursor);
+            bool isMark = (idx == marked);
 
             WORD rowAttr = isMark ? C_MARKED : (isCur ? C_HOVER : 0);
             if (isCur || isMark)
@@ -394,62 +511,82 @@ struct App {
             }
 
             if (!isCur && !isMark) {
-                surf.put(0, row, L'\x2502', C_BORDER);
-                surf.put(W - 1, row, L'\x2502', C_BORDER);
+                surf.put(0, row, L'|', C_BORDER);
+                surf.put(W - 1, row, L'|', C_BORDER);
             }
         }
 
-        // scrollbar
         if (rows > lh) {
             int barH = lh;
             int thumbH = std::max(1, barH * lh / rows);
             int thumbY = (rows > 1) ? (scroll * (barH - thumbH) / (rows - lh)) : 0;
             for (int i = 0; i < barH; ++i)
                 surf.put(W - 2, list_top() + i,
-                    (i >= thumbY && i < thumbY + thumbH) ? L'\x2588' : L'\x2591',
+                    (i >= thumbY && i < thumbY + thumbH) ? L'#' : L'.',
                     C_BORDER);
         }
 
-        // status bar
-        int sy1 = H - 2;
-        int sy2 = H - 1;
+        int SR = status_rows(W);
+        int HR = hint_rows(W);
 
-        auto hint = [&](int& x, int row, const wchar_t* key, const wchar_t* val) {
-            surf.text(x, row, key, C_STATUS_K);
-            x += (int)wcslen(key);
-            surf.text(x, row, val, C_STATUS_V);
-            x += (int)wcslen(val) + 1;
-            };
-
-        int hx = 2;
-        hint(hx, sy1, L"[Up/Dn]", L"move");
-        hint(hx, sy1, L"[Rt]", L"mark");
-        hint(hx, sy1, L"[Lt]", L"unmark");
-        hint(hx, sy1, L"[I]", L"inject");
-        hint(hx, sy1, L"[E]", L"eject");
-        hint(hx, sy1, L"[D]", L"set dll");
-        hint(hx, sy1, L"[Q]", L"quit");
-        if (!isAdmin) hint(hx, sy1, L"[R]", L"Run as Admin");
-
-        if (!status.empty()) {
-            int avail = W - hx - 4;
-            std::wstring msg = L"  " + status;
-            if ((int)msg.size() > avail) msg = msg.substr(0, avail);
-            surf.text(hx + 1, sy1, msg.c_str(), statusColor);
-        }
+        int row_dll = H - 1;
+        int row_status = H - 1 - SR;
+        int row_hints = H - 1 - SR - HR;
 
         {
             int sx = 2;
             std::wstring dp = dllPath.empty() ? L"(none)" : dllPath.filename().wstring();
-            hint(sx, sy2, L"dll:", (dp + L" ").c_str());
+            std::wstring dllLabel = L"dll:" + dp + L" ";
+            surf.text(sx, row_dll, dllLabel.c_str(), C_STATUS_K);
+            sx += (int)dllLabel.size();
 
             if (marked >= 0 && marked < (int)procs.size()) {
                 std::wstring mn = L"marked: " + procs[marked].name
                     + L" (PID " + std::to_wstring(procs[marked].pid) + L")";
-                surf.text(sx + 1, sy2, mn.c_str(), C_INJECT);
+                int avail = W - sx - 2;
+                if ((int)mn.size() > avail) mn = mn.substr(0, avail);
+                surf.text(sx, row_dll, mn.c_str(), C_INJECT);
             }
             else {
-                surf.text(sx + 1, sy2, L"no selection", C_DIM);
+                surf.text(sx, row_dll, L"no selection", C_DIM);
+            }
+        }
+
+        if (!status.empty()) {
+            int usable_s = W - 4;
+            if (usable_s < 1) usable_s = 1;
+            std::wstring msg = status;
+            for (int r = 0; r < SR && !msg.empty(); ++r) {
+                std::wstring line = msg.substr(0, (size_t)usable_s);
+                msg = (msg.size() > (size_t)usable_s) ? msg.substr((size_t)usable_s) : L"";
+                surf.text(2, row_status + r, line.c_str(), statusColor);
+            }
+        }
+
+        {
+            struct HintToken { const wchar_t* key; const wchar_t* val; };
+            HintToken tokens[] = {
+                {L"[Up/Dn]",   L"move"},
+                {L"[PgUp/Dn]", L"page"},
+                {L"[Rt]",      L"mark"},
+                {L"[Lt]",      L"unmark"},
+                {L"[I]",       L"inject"},
+                {L"[E]",       L"eject"},
+                {L"[D]",       L"set dll"},
+                {L"[/]",       L"search"},
+                {L"[Q]",       L"quit"},
+                {L"[R]",       L"Run as Admin"},
+            };
+            int nTokens = isAdmin ? 9 : 10;
+            int usable_h = W - 3;
+            int cur_x = 2, cur_row = 0;
+            for (int i = 0; i < nTokens; ++i) {
+                int w = (int)(wcslen(tokens[i].key) + wcslen(tokens[i].val)) + 1;
+                if (cur_x + w > usable_h && cur_x > 2) { ++cur_row; cur_x = 2; }
+                int sr = row_hints + cur_row;
+                surf.text(cur_x, sr, tokens[i].key, C_STATUS_K);
+                surf.text(cur_x + (int)wcslen(tokens[i].key), sr, tokens[i].val, C_STATUS_V);
+                cur_x += w;
             }
         }
 
@@ -595,32 +732,75 @@ struct App {
             DWORD wait = WaitForSingleObject(hin, timeout);
 
             if (wait == WAIT_TIMEOUT) {
-                refresh_procs();
-                lastRefresh = GetTickCount();
+                if (!searching) {
+                    refresh_procs();
+                    lastRefresh = GetTickCount();
+                }
                 draw();
                 continue;
             }
 
-            // input available
             INPUT_RECORD ir;
             DWORD        nr = 0;
             ReadConsoleInputW(hin, &ir, 1, &nr);
 
             if (ir.EventType == KEY_EVENT && ir.Event.KeyEvent.bKeyDown) {
                 auto vk = ir.Event.KeyEvent.wVirtualKeyCode;
-                auto ch = towlower(ir.Event.KeyEvent.uChar.UnicodeChar);
+                auto ch = ir.Event.KeyEvent.uChar.UnicodeChar;
+
+                if (searching) {
+                    if (vk == VK_ESCAPE) {
+                        searching = false;
+                        searchBuf.clear();
+                        rebuild_view();
+                        set_status(L"Search cleared", C_DIM);
+                    }
+                    else if (vk == VK_RETURN) {
+                        searching = false;
+                        if (searchBuf.empty())
+                            set_status(L"", C_NORMAL);
+                        else {
+                            wchar_t buf[128];
+                            swprintf(buf, 128, L"Filter: \"%s\"  (%d results)", searchBuf.c_str(), (int)view.size());
+                            set_status(buf, C_SEARCH_K);
+                        }
+                    }
+                    else if (vk == VK_BACK) {
+                        if (!searchBuf.empty()) {
+                            searchBuf.pop_back();
+                            rebuild_view();
+                        }
+                    }
+                    else if (vk == VK_UP) {
+                        if (cursor > 0) --cursor;
+                    }
+                    else if (vk == VK_DOWN) {
+                        if (cursor < (int)view.size() - 1) ++cursor;
+                    }
+                    else if (ch >= L' ') {
+                        searchBuf += ch;
+                        rebuild_view();
+                        cursor = 0;
+                        scroll = 0;
+                    }
+
+                    draw();
+                    continue;
+                }
+
+                auto lch = towlower(ch);
 
                 if (vk == VK_UP) {
                     if (cursor > 0) --cursor;
                     set_status(L"");
                 }
                 else if (vk == VK_DOWN) {
-                    if (cursor < (int)procs.size() - 1) ++cursor;
+                    if (cursor < (int)view.size() - 1) ++cursor;
                     set_status(L"");
                 }
                 else if (vk == VK_RIGHT) {
-                    if (!procs.empty()) {
-                        marked = cursor;
+                    if (!view.empty()) {
+                        marked = view[cursor];
                         set_status(L"");
                     }
                 }
@@ -632,12 +812,21 @@ struct App {
                     cursor = std::max(0, cursor - list_height());
                 }
                 else if (vk == VK_NEXT) {
-                    cursor = std::min((int)procs.size() - 1, cursor + list_height());
+                    cursor = std::min((int)view.size() - 1, cursor + list_height());
                 }
-                else if (ch == L'r' && !isAdmin) {
+                else if (lch == L'r' && !isAdmin) {
                     relaunch_as_admin();
                 }
-                else if (ch == L'd') {
+                else if (ch == L'/') {
+                    searching = true;
+                    set_status(L"");
+                }
+                else if (vk == VK_ESCAPE && !searchBuf.empty()) {
+                    searchBuf.clear();
+                    rebuild_view();
+                    set_status(L"Filter cleared", C_DIM);
+                }
+                else if (lch == L'd') {
                     SetConsoleMode(hin, ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
                     try {
                         fs::path p = SelectFile();
@@ -655,13 +844,13 @@ struct App {
                     }
                     SetConsoleMode(hin, ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT);
                 }
-                else if (ch == L'i') {
+                else if (lch == L'i') {
                     do_inject();
                 }
-                else if (ch == L'e') {
+                else if (lch == L'e') {
                     do_eject();
                 }
-                else if (ch == L'q' || vk == VK_ESCAPE) {
+                else if (lch == L'q' || vk == VK_ESCAPE) {
                     break;
                 }
 
