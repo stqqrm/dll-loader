@@ -324,10 +324,18 @@ struct App {
             if (proc_matches(procs[i], needle))
                 view.push_back(i);
 
-        cursor = 0;
-        if (old_pid) {
+        if (old_pid != (DWORD)(uint16_t)-1) {
+            bool found = false;
             for (int i = 0; i < (int)view.size(); ++i) {
-                if (procs[view[i]].pid == old_pid) { cursor = i; break; }
+                if (procs[view[i]].pid == old_pid) { cursor = i; found = true; break; }
+            }
+            if (!found)
+                cursor = std::max(0, std::min(cursor, (int)view.size() - 1));
+        }
+        else {
+            cursor = 0;
+            for (int i = 0; i < (int)view.size(); ++i) {
+                if (procs[view[i]].pid != (DWORD)(uint16_t)-1) { cursor = i; break; }
             }
         }
         int lh = list_height();
@@ -339,13 +347,13 @@ struct App {
     DWORD view_cursor_pid() const {
         if (cursor >= 0 && cursor < (int)view.size())
             return procs[view[cursor]].pid;
-        return 0;
+        return (DWORD)(uint16_t)-1;
     }
 
     void refresh_procs() {
         DWORD cursorPid = view_cursor_pid();
         DWORD markedPid = (marked >= 0 && marked < (int)procs.size())
-            ? procs[marked].pid : 0;
+            ? procs[marked].pid : (DWORD)(uint16_t)-1;
 
         procs = enumerate_processes();
 
@@ -355,7 +363,7 @@ struct App {
 
         rebuild_view();
 
-        if (cursorPid) {
+        if (cursorPid != (DWORD)(uint16_t)-1) {
             for (int i = 0; i < (int)view.size(); ++i) {
                 if (procs[view[i]].pid == cursorPid) { cursor = i; break; }
             }
@@ -375,12 +383,11 @@ struct App {
             {L"[E]",       L"eject"},
             {L"[D]",       L"set dll"},
             {L"[/]",       L"search"},
-            {L"[Q]",       L"quit"},
             {L"[R]",       L"Run as Admin"},
         };
         int usable = W - 3;
         int rows = 1, x = 2;
-        int count = isAdmin ? 9 : 10;
+        int count = isAdmin ? 8 : 9;
         for (int i = 0; i < count; ++i) {
             int w = (int)(wcslen(tokens[i].key) + wcslen(tokens[i].val)) + 1;
             if (x + w > usable && x > 2) { ++rows; x = 2; }
@@ -574,10 +581,9 @@ struct App {
                 {L"[E]",       L"eject"},
                 {L"[D]",       L"set dll"},
                 {L"[/]",       L"search"},
-                {L"[Q]",       L"quit"},
-                {L"[R]",       L"Run as Admin"},
+                    {L"[R]",       L"Run as Admin"},
             };
-            int nTokens = isAdmin ? 9 : 10;
+            int nTokens = isAdmin ? 8 : 9;
             int usable_h = W - 3;
             int cur_x = 2, cur_row = 0;
             for (int i = 0; i < nTokens; ++i) {
@@ -850,7 +856,7 @@ struct App {
                 else if (lch == L'e') {
                     do_eject();
                 }
-                else if (lch == L'q' || vk == VK_ESCAPE) {
+                else if (vk == VK_ESCAPE) {
                     break;
                 }
 
